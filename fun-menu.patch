@@ -1,0 +1,501 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 95ddcd6..6327420 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -320,4 +320,15 @@ elseif (IOS)
+ 		set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/ios/Assets.xcassets"
+ 			PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+ 	endif()
++
++	# A private owner build may include legally obtained game data here. Copy it
++	# into the application bundle so the resulting IPA is self-contained.
++	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ios/BundledResources/main.pak" AND
++		EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ios/BundledResources/properties")
++		add_custom_command(TARGET pvz-portable POST_BUILD
++			COMMAND ${CMAKE_COMMAND} -E copy_directory
++				"${CMAKE_CURRENT_SOURCE_DIR}/ios/BundledResources"
++				"$<TARGET_BUNDLE_DIR:pvz-portable>"
++			COMMENT "Copying owner-provided PvZ resources into the iOS bundle")
++	endif()
+ endif()
+diff --git a/FUN_MENU_BUILD.md b/FUN_MENU_BUILD.md
+new file mode 100644
+index 0000000..113bc6a
+--- /dev/null
++++ b/FUN_MENU_BUILD.md
+@@ -0,0 +1,28 @@
++# iOS integrated fun-menu build
++
++This private build adds an in-game floating **菜单** button and five opt-in
++features. All switches default to off:
++
++- 无限阳光
++- 植物无冷却
++- 种植不耗阳光
++- 自动收集
++- 游戏加速（2x）
++
++The menu consumes touches inside its panel, so taps do not reach plants or
++coins behind it. Conveyor-belt and slot-machine seed behaviour is kept intact.
++
++Owner-provided game data is stored under `ios/BundledResources/` and copied
++into the app at build time. On iOS, files manually placed in the app's
++Documents directory take precedence over bundled data. Save data remains in
++Documents.
++
++Build on macOS with Xcode 15+, CMake 3.21+, and vcpkg:
++
++```sh
++export VCPKG_ROOT=/path/to/vcpkg
++./ios/build-ios.sh Release
++```
++
++The unsigned result is `build-ios/pvz-portable-ios.ipa`. It must be signed
++before installation.
+diff --git a/src/Lawn/Board.cpp b/src/Lawn/Board.cpp
+index 665fcca..697a288 100644
+--- a/src/Lawn/Board.cpp
++++ b/src/Lawn/Board.cpp
+@@ -25,6 +25,7 @@
+ #include <format>
+ #include "ZenGarden.h"
+ #include "BoardInclude.h"
++#include "FunMenu.h"
+ #include "LawnCommon.h"
+ #include "System/Music.h"
+ #include "System/SaveGame.h"
+@@ -235,7 +236,10 @@ Board::Board(LawnApp* theApp)
+ 	}
+ }
+ 
+-Board::~Board() = default;
++Board::~Board()
++{
++	FunMenu::BoardDestroyed(mApp);
++}
+ 
+ void BoardInitForPlayer()
+ {
+@@ -3771,7 +3775,8 @@ void Board::MouseDownWithPlant(int x, int y, int theClickCount)
+ 	ClearAdvice(AdviceType::ADVICE_PLANT_POTATOE_MINE_ON_LILY);
+ 	ClearAdvice(AdviceType::ADVICE_SURVIVE_FLAGS);
+ 
+-	if (!mApp->mEasyPlantingCheat && mCursorObject->mCursorType == CursorType::CURSOR_TYPE_PLANT_FROM_BANK && !HasConveyorBeltSeedBank())
++	if (!mApp->mEasyPlantingCheat && !FunMenu::FreePlantingEnabled() &&
++		mCursorObject->mCursorType == CursorType::CURSOR_TYPE_PLANT_FROM_BANK && !HasConveyorBeltSeedBank())
+ 	{
+ 		if (!TakeSunMoney(GetCurrentPlantCost(aPlantingSeedType, SeedType::SEED_NONE)))
+ 		{
+@@ -4363,6 +4368,11 @@ void Board::PickUpTool(GameObjectType theObjectType)
+ void Board::MouseDown(int x, int y, int theClickCount)
+ {
+ 	UpdateMousePosition();
++	if (FunMenu::HandleMouseDown(this, x, y, theClickCount))
++	{
++		mIgnoreMouseUp = true;
++		return;
++	}
+ 	Widget::MouseDown(x, y, theClickCount);
+ 	mIgnoreMouseUp = !CanInteractWithBoardButtons();
+ 	if (mTimeStopCounter > 0)
+@@ -5696,6 +5706,7 @@ void Board::Update()
+ 
+ 	Widget::Update();
+ 	MarkDirty();
++	FunMenu::Apply(this);
+ 
+ 	mBoardUpdateCounter++;
+ 	mCutScene->Update();
+@@ -7465,6 +7476,7 @@ void Board::Draw(Graphics* g)
+ 
+ 	mDrawCount++;
+ 	DrawGameObjects(g);
++	FunMenu::Draw(this, g);
+ }
+ 
+ void Board::SetMustacheMode(bool theEnableMustache)
+diff --git a/src/Lawn/FunMenu.cpp b/src/Lawn/FunMenu.cpp
+new file mode 100644
+index 0000000..b5ee303
+--- /dev/null
++++ b/src/Lawn/FunMenu.cpp
+@@ -0,0 +1,244 @@
++/*
++ * Optional in-game fun menu for the iOS-oriented PvZ Portable build.
++ * SPDX-License-Identifier: LGPL-3.0-or-later
++ */
++
++#include "FunMenu.h"
++
++#include <array>
++#include <cmath>
++#include <string_view>
++
++#include "Board.h"
++#include "Coin.h"
++#include "SeedPacket.h"
++#include "../LawnApp.h"
++#include "../Resources.h"
++#include "../PvzpLib/PvzpCommon.h"
++#include "graphics/Graphics.h"
++#include "misc/Rect.h"
++
++using namespace Sexy;
++
++namespace
++{
++	constexpr int MENU_BALL_X = 760;
++	constexpr int MENU_BALL_Y = 300;
++	constexpr int MENU_BALL_RADIUS = 32;
++	constexpr int PANEL_X = 430;
++	constexpr int PANEL_Y = 135;
++	constexpr int PANEL_WIDTH = 305;
++	constexpr int PANEL_HEIGHT = 330;
++	constexpr int ROW_Y = 195;
++	constexpr int ROW_HEIGHT = 50;
++	constexpr int CHECKBOX_X = 681;
++	constexpr int CHECKBOX_SIZE = 28;
++
++	struct FunMenuState
++	{
++		bool mOpen = false;
++		bool mInfiniteSun = false;
++		bool mNoCooldown = false;
++		bool mFreePlanting = false;
++		bool mAutoCollect = false;
++		bool mGameSpeed = false;
++	};
++
++	FunMenuState gFunMenuState;
++
++	bool PointInMenuBall(int theX, int theY)
++	{
++		const int aDeltaX = theX - MENU_BALL_X;
++		const int aDeltaY = theY - MENU_BALL_Y;
++		return aDeltaX * aDeltaX + aDeltaY * aDeltaY <= MENU_BALL_RADIUS * MENU_BALL_RADIUS;
++	}
++
++	void FillCircle(Graphics* g, int theCenterX, int theCenterY, int theRadius, const Color& theColor)
++	{
++		constexpr int POINT_COUNT = 32;
++		constexpr double PI = 3.14159265358979323846;
++		std::array<Point, POINT_COUNT> aPoints;
++		for (int i = 0; i < POINT_COUNT; i++)
++		{
++			const double anAngle = 2.0 * PI * i / POINT_COUNT;
++			aPoints[i] = Point(
++				theCenterX + static_cast<int>(std::cos(anAngle) * theRadius),
++				theCenterY + static_cast<int>(std::sin(anAngle) * theRadius));
++		}
++		g->SetColor(theColor);
++		g->PolyFillAA(aPoints.data(), POINT_COUNT, true);
++	}
++
++	void DrawCheckbox(Graphics* g, int theY, bool theEnabled)
++	{
++		const Rect aBox(CHECKBOX_X, theY, CHECKBOX_SIZE, CHECKBOX_SIZE);
++		if (theEnabled)
++		{
++			g->SetColor(Color(67, 154, 78, 255));
++			g->FillRect(aBox);
++		}
++		g->SetColor(Color(244, 235, 190, 255));
++		g->DrawRect(aBox);
++		g->DrawRect(aBox.mX + 1, aBox.mY + 1, aBox.mWidth - 2, aBox.mHeight - 2);
++
++		if (theEnabled)
++		{
++			g->SetColor(Color::White);
++			g->DrawLine(aBox.mX + 6, aBox.mY + 15, aBox.mX + 12, aBox.mY + 21);
++			g->DrawLine(aBox.mX + 12, aBox.mY + 21, aBox.mX + 23, aBox.mY + 7);
++			g->DrawLine(aBox.mX + 6, aBox.mY + 16, aBox.mX + 12, aBox.mY + 22);
++			g->DrawLine(aBox.mX + 12, aBox.mY + 22, aBox.mX + 23, aBox.mY + 8);
++		}
++	}
++}
++
++bool FunMenu::HandleMouseDown(Board* theBoard, int theX, int theY, int theClickCount)
++{
++	if (theClickCount < 0)
++		return false;
++
++	if (PointInMenuBall(theX, theY))
++	{
++		gFunMenuState.mOpen = !gFunMenuState.mOpen;
++		theBoard->mApp->PlaySample(Sexy::SOUND_BUTTONCLICK);
++		return true;
++	}
++
++	if (!gFunMenuState.mOpen)
++		return false;
++
++	const Rect aPanel(PANEL_X, PANEL_Y, PANEL_WIDTH, PANEL_HEIGHT);
++	if (!aPanel.Contains(theX, theY))
++		return false;
++
++	const Rect aCloseButton(PANEL_X + PANEL_WIDTH - 38, PANEL_Y + 8, 30, 30);
++	if (aCloseButton.Contains(theX, theY))
++	{
++		gFunMenuState.mOpen = false;
++		theBoard->mApp->PlaySample(Sexy::SOUND_BUTTONCLICK);
++		return true;
++	}
++
++	for (int i = 0; i < 5; i++)
++	{
++		const Rect aRow(PANEL_X + 12, ROW_Y + i * ROW_HEIGHT, PANEL_WIDTH - 24, ROW_HEIGHT - 3);
++		if (!aRow.Contains(theX, theY))
++			continue;
++
++		switch (i)
++		{
++		case 0: gFunMenuState.mInfiniteSun = !gFunMenuState.mInfiniteSun; break;
++		case 1: gFunMenuState.mNoCooldown = !gFunMenuState.mNoCooldown; break;
++		case 2: gFunMenuState.mFreePlanting = !gFunMenuState.mFreePlanting; break;
++		case 3: gFunMenuState.mAutoCollect = !gFunMenuState.mAutoCollect; break;
++		case 4:
++			gFunMenuState.mGameSpeed = !gFunMenuState.mGameSpeed;
++			theBoard->mApp->mUpdateMultiplier = gFunMenuState.mGameSpeed ? 2.0 : 1.0;
++			break;
++		default: break;
++		}
++		theBoard->mApp->PlaySample(Sexy::SOUND_BUTTONCLICK);
++		Apply(theBoard);
++		return true;
++	}
++
++	// Swallow touches inside the panel so they never plant or collect behind it.
++	return true;
++}
++
++void FunMenu::Apply(Board* theBoard)
++{
++	if (gFunMenuState.mInfiniteSun)
++		theBoard->mSunMoney = 9990;
++
++	if (gFunMenuState.mNoCooldown && theBoard->mSeedBank &&
++		!theBoard->HasConveyorBeltSeedBank() && !theBoard->mApp->IsSlotMachineLevel())
++	{
++		for (int i = 0; i < theBoard->mSeedBank->mNumPackets; i++)
++		{
++			SeedPacket& aPacket = theBoard->mSeedBank->mSeedPackets[i];
++			if (aPacket.mPacketType == SeedType::SEED_NONE || aPacket.mSlotMachineCountDown > 0)
++				continue;
++			aPacket.mRefreshCounter = 0;
++			aPacket.mRefreshing = false;
++			aPacket.mActive = true;
++		}
++	}
++
++	if (gFunMenuState.mAutoCollect)
++	{
++		for (Coin* aCoin : theBoard->mCoins)
++		{
++			if (!aCoin->mDead && !aCoin->mIsBeingCollected && (aCoin->IsSun() || aCoin->IsMoney()))
++				aCoin->Collect();
++		}
++	}
++
++	theBoard->mApp->mUpdateMultiplier = gFunMenuState.mGameSpeed ? 2.0 : 1.0;
++}
++
++void FunMenu::BoardDestroyed(LawnApp* theApp)
++{
++	if (theApp)
++		theApp->mUpdateMultiplier = 1.0;
++	gFunMenuState.mOpen = false;
++}
++
++bool FunMenu::FreePlantingEnabled()
++{
++	return gFunMenuState.mFreePlanting;
++}
++
++bool FunMenu::NoCooldownEnabled()
++{
++	return gFunMenuState.mNoCooldown;
++}
++
++void FunMenu::Draw([[maybe_unused]] Board* theBoard, Graphics* g)
++{
++	GraphicsStateGuard aStateGuard(*g);
++
++	if (gFunMenuState.mOpen)
++	{
++		g->SetColor(Color(0, 0, 0, 38));
++		g->FillRect(0, 0, BOARD_WIDTH, BOARD_HEIGHT);
++
++		g->SetColor(Color(21, 70, 39, 236));
++		g->FillRect(PANEL_X, PANEL_Y, PANEL_WIDTH, PANEL_HEIGHT);
++		g->SetColor(Color(232, 201, 99, 255));
++		g->DrawRect(PANEL_X, PANEL_Y, PANEL_WIDTH, PANEL_HEIGHT);
++		g->DrawRect(PANEL_X + 2, PANEL_Y + 2, PANEL_WIDTH - 4, PANEL_HEIGHT - 4);
++
++		PvzpDrawString(g, "趣味功能", PANEL_X + PANEL_WIDTH / 2, PANEL_Y + 38,
++			Sexy::FONT_DWARVENTODCRAFT18YELLOW, Color::White, DrawStringJustification::DS_ALIGN_CENTER);
++		PvzpDrawString(g, "×", PANEL_X + PANEL_WIDTH - 22, PANEL_Y + 31,
++			Sexy::FONT_DWARVENTODCRAFT18, Color(255, 242, 190), DrawStringJustification::DS_ALIGN_CENTER);
++
++		constexpr std::array<std::string_view, 5> LABELS = {
++			"无限阳光", "植物无冷却", "种植不耗阳光", "自动收集", "游戏加速"
++		};
++		const std::array<bool, 5> aEnabled = {
++			gFunMenuState.mInfiniteSun,
++			gFunMenuState.mNoCooldown,
++			gFunMenuState.mFreePlanting,
++			gFunMenuState.mAutoCollect,
++			gFunMenuState.mGameSpeed
++		};
++
++		for (int i = 0; i < 5; i++)
++		{
++			const int aY = ROW_Y + i * ROW_HEIGHT;
++			g->SetColor(Color(9, 45, 28, 150));
++			g->FillRect(PANEL_X + 12, aY, PANEL_WIDTH - 24, ROW_HEIGHT - 3);
++			PvzpDrawString(g, LABELS[i], PANEL_X + 28, aY + 31,
++				Sexy::FONT_BRIANNETOD16, Color::White, DrawStringJustification::DS_ALIGN_LEFT);
++			DrawCheckbox(g, aY + 9, aEnabled[i]);
++		}
++	}
++
++	FillCircle(g, MENU_BALL_X, MENU_BALL_Y, MENU_BALL_RADIUS, Color(232, 201, 99, 255));
++	FillCircle(g, MENU_BALL_X, MENU_BALL_Y, MENU_BALL_RADIUS - 4, Color(31, 150, 64, 245));
++	FillCircle(g, MENU_BALL_X - 8, MENU_BALL_Y - 9, 7, Color(145, 239, 151, 150));
++	PvzpDrawString(g, "菜单", MENU_BALL_X, MENU_BALL_Y + 7,
++		Sexy::FONT_BRIANNETOD16, Color::White, DrawStringJustification::DS_ALIGN_CENTER);
++}
+diff --git a/src/Lawn/FunMenu.h b/src/Lawn/FunMenu.h
+new file mode 100644
+index 0000000..a30fdc5
+--- /dev/null
++++ b/src/Lawn/FunMenu.h
+@@ -0,0 +1,28 @@
++/*
++ * Optional in-game fun menu for the iOS-oriented PvZ Portable build.
++ * SPDX-License-Identifier: LGPL-3.0-or-later
++ */
++
++#ifndef __FUNMENU_H__
++#define __FUNMENU_H__
++
++class Board;
++class LawnApp;
++
++namespace Sexy
++{
++	class Graphics;
++}
++
++namespace FunMenu
++{
++	bool HandleMouseDown(Board* theBoard, int theX, int theY, int theClickCount);
++	void Draw(Board* theBoard, Sexy::Graphics* g);
++	void Apply(Board* theBoard);
++	void BoardDestroyed(LawnApp* theApp);
++
++	bool FreePlantingEnabled();
++	bool NoCooldownEnabled();
++}
++
++#endif
+diff --git a/src/Lawn/SeedPacket.cpp b/src/Lawn/SeedPacket.cpp
+index 4513ff1..9bea892 100644
+--- a/src/Lawn/SeedPacket.cpp
++++ b/src/Lawn/SeedPacket.cpp
+@@ -24,6 +24,7 @@
+ #include "Cutscene.h"
+ #include "Challenge.h"
+ #include "SeedPacket.h"
++#include "FunMenu.h"
+ #include "../LawnApp.h"
+ #include "CursorObject.h"
+ #include "../Resources.h"
+@@ -674,7 +675,8 @@ void SeedPacket::Draw(Graphics* g)
+ 		{
+ 			aPercentDark = 0.0f;
+ 		}
+-		else if ((!mBoard->CanTakeSunMoney(aCost) && aDrawCost) || aPercentDark > 1.0f || !mBoard->PlantingRequirementsMet(aUseSeedType))
++		else if ((!FunMenu::FreePlantingEnabled() && !mBoard->CanTakeSunMoney(aCost) && aDrawCost) ||
++			aPercentDark > 1.0f || !mBoard->PlantingRequirementsMet(aUseSeedType))
+ 		{
+ 			aGrayness = 128;
+ 		}
+@@ -709,7 +711,7 @@ bool SeedPacket::CanPickUp()
+ 		}
+ 
+ 		int aCost = mBoard->GetCurrentPlantCost(mPacketType, mImitaterType);
+-		if (!mBoard->CanTakeSunMoney(aCost) && !mBoard->HasConveyorBeltSeedBank())
++		if (!FunMenu::FreePlantingEnabled() && !mBoard->CanTakeSunMoney(aCost) && !mBoard->HasConveyorBeltSeedBank())
+ 		{
+ 			return false;
+ 		}
+@@ -759,7 +761,7 @@ void SeedPacket::MouseDown([[maybe_unused]] int x, [[maybe_unused]] int y, [[may
+ 		}
+ 
+ 		int aCost = mBoard->GetCurrentPlantCost(mPacketType, mImitaterType);
+-		if (!mBoard->CanTakeSunMoney(aCost) && !mBoard->HasConveyorBeltSeedBank())
++		if (!FunMenu::FreePlantingEnabled() && !mBoard->CanTakeSunMoney(aCost) && !mBoard->HasConveyorBeltSeedBank())
+ 		{
+ 			mApp->PlaySample(SOUND_BUZZER);
+ 			mBoard->mOutOfMoneyCounter = 70;
+@@ -872,6 +874,15 @@ void SeedPacket::MouseDown([[maybe_unused]] int x, [[maybe_unused]] int y, [[may
+ void SeedPacket::WasPlanted()
+ {
+ 	PVZP_ASSERT(mPacketType != SeedType::SEED_NONE);
++	if (FunMenu::NoCooldownEnabled() && !mBoard->HasConveyorBeltSeedBank() && !mApp->IsSlotMachineLevel())
++	{
++		mTimesUsed++;
++		mRefreshCounter = 0;
++		mRefreshing = false;
++		mActive = true;
++		FlashIfReady();
++		return;
++	}
+ 
+ 	if (mBoard->HasConveyorBeltSeedBank())
+ 	{
+diff --git a/src/SexyAppFramework/SexyAppBase.cpp b/src/SexyAppFramework/SexyAppBase.cpp
+index a7b1fb1..4b40677 100644
+--- a/src/SexyAppFramework/SexyAppBase.cpp
++++ b/src/SexyAppFramework/SexyAppBase.cpp
+@@ -187,7 +187,9 @@ SexyAppBase::SexyAppBase()
+ 		mResourceDir = "";
+ 	}
+ #elif defined(__IPHONEOS__)
+-	// iOS: use Documents directory (visible in Files app via UIFileSharingEnabled)
++	// iOS: prefer Documents (visible in Files), then fall back to resources
++	// bundled inside the app. This lets a private build ship as one IPA while
++	// still allowing the owner to replace the resources without reinstalling.
+ 	{
+ 		const char* aHome = std::getenv("HOME");
+ 		if (aHome != nullptr && aHome[0] != '\0')
+@@ -198,6 +200,28 @@ SexyAppBase::SexyAppBase()
+ 		{
+ 			mResourceDir = "";
+ 		}
++
++		const std::filesystem::path aDocumentsPath(mResourceDir);
++		const bool aDocumentsHasResources =
++			std::filesystem::is_regular_file(aDocumentsPath / "main.pak") &&
++			std::filesystem::is_directory(aDocumentsPath / "properties");
++		if (!aDocumentsHasResources)
++		{
++			char* aBasePathString = SDL_GetBasePath();
++			if (aBasePathString != nullptr)
++			{
++				std::filesystem::path aBasePath(aBasePathString);
++				SDL_free(aBasePathString);
++				std::filesystem::path aBundledPath = aBasePath;
++				if (!std::filesystem::is_regular_file(aBundledPath / "main.pak"))
++					aBundledPath /= "Resources";
++				if (std::filesystem::is_regular_file(aBundledPath / "main.pak") &&
++					std::filesystem::is_directory(aBundledPath / "properties"))
++				{
++					mResourceDir = aBundledPath.generic_string() + "/";
++				}
++			}
++		}
+ 	}
+ #elif defined(__EMSCRIPTEN__)
+ 	mResourceDir = "/";
+
