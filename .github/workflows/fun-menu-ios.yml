@@ -78,10 +78,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp dist/pvz-portable-ios-arm64-fun-menu.ipa "$RUNNER_TEMP/pvz-portable-ios-arm64-fun-menu.ipa"
+          git reset --hard HEAD
           git switch --orphan codex/ios-fun-menu-output
           git rm -rf .
           mkdir -p output
-          cp dist/pvz-portable-ios-arm64-fun-menu.ipa output/
+          cp "$RUNNER_TEMP/pvz-portable-ios-arm64-fun-menu.ipa" output/
           git add -f output/pvz-portable-ios-arm64-fun-menu.ipa
           git commit -m "Publish unsigned iOS fun menu build"
           git push --force origin HEAD:codex/ios-fun-menu-output
