@@ -20,10 +20,10 @@ index 95ddcd6..6327420 100644
  endif()
 diff --git a/FUN_MENU_BUILD.md b/FUN_MENU_BUILD.md
 new file mode 100644
-index 0000000..113bc6a
+index 0000000..8809cae
 --- /dev/null
 +++ b/FUN_MENU_BUILD.md
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,32 @@
 +# iOS integrated fun-menu build
 +
 +This private build adds an in-game floating **菜单** button and five opt-in
@@ -34,6 +34,10 @@ index 0000000..113bc6a
 +- 种植不耗阳光
 +- 自动收集
 +- 游戏加速（2x）
++
++The floating button can be dragged anywhere within the game screen; a short
++tap opens or closes the panel. The iOS build requests a Retina drawable and
++fills the display, with touch coordinates mapped back to the 800x600 game UI.
 +
 +The menu consumes touches inside its panel, so taps do not reach plants or
 +coins behind it. Conveyor-belt and slot-machine seed behaviour is kept intact.
@@ -53,7 +57,7 @@ index 0000000..113bc6a
 +The unsigned result is `build-ios/pvz-portable-ios.ipa`. It must be signed
 +before installation.
 diff --git a/src/Lawn/Board.cpp b/src/Lawn/Board.cpp
-index 665fcca..697a288 100644
+index 665fcca..17d6708 100644
 --- a/src/Lawn/Board.cpp
 +++ b/src/Lawn/Board.cpp
 @@ -25,6 +25,7 @@
@@ -76,7 +80,16 @@ index 665fcca..697a288 100644
  
  void BoardInitForPlayer()
  {
-@@ -3771,7 +3775,8 @@ void Board::MouseDownWithPlant(int x, int y, int theClickCount)
+@@ -3008,6 +3012,8 @@ void Board::MouseMove(int x, int y)
+ 
+ void Board::MouseDrag(int x, int y)
+ {
++	if (FunMenu::HandleMouseDrag(this, x, y))
++		return;
+ 	Widget::MouseDrag(x, y);
+ 	mChallenge->MouseMove(x, y);
+ }
+@@ -3771,7 +3777,8 @@ void Board::MouseDownWithPlant(int x, int y, int theClickCount)
  	ClearAdvice(AdviceType::ADVICE_PLANT_POTATOE_MINE_ON_LILY);
  	ClearAdvice(AdviceType::ADVICE_SURVIVE_FLAGS);
  
@@ -86,7 +99,7 @@ index 665fcca..697a288 100644
  	{
  		if (!TakeSunMoney(GetCurrentPlantCost(aPlantingSeedType, SeedType::SEED_NONE)))
  		{
-@@ -4363,6 +4368,11 @@ void Board::PickUpTool(GameObjectType theObjectType)
+@@ -4363,6 +4370,11 @@ void Board::PickUpTool(GameObjectType theObjectType)
  void Board::MouseDown(int x, int y, int theClickCount)
  {
  	UpdateMousePosition();
@@ -98,7 +111,19 @@ index 665fcca..697a288 100644
  	Widget::MouseDown(x, y, theClickCount);
  	mIgnoreMouseUp = !CanInteractWithBoardButtons();
  	if (mTimeStopCounter > 0)
-@@ -5696,6 +5706,7 @@ void Board::Update()
+@@ -4580,6 +4592,11 @@ bool Board::CanInteractWithBoardButtons()
+ 
+ void Board::MouseUp(int x, int y, int theClickCount)
+ {
++	if (FunMenu::HandleMouseUp(this, x, y, theClickCount))
++	{
++		mIgnoreMouseUp = false;
++		return;
++	}
+ 	Widget::MouseUp(x, y, theClickCount);
+ 	if (mIgnoreMouseUp)
+ 	{
+@@ -5696,6 +5713,7 @@ void Board::Update()
  
  	Widget::Update();
  	MarkDirty();
@@ -106,7 +131,7 @@ index 665fcca..697a288 100644
  
  	mBoardUpdateCounter++;
  	mCutScene->Update();
-@@ -7465,6 +7476,7 @@ void Board::Draw(Graphics* g)
+@@ -7465,6 +7483,7 @@ void Board::Draw(Graphics* g)
  
  	mDrawCount++;
  	DrawGameObjects(g);
@@ -116,10 +141,10 @@ index 665fcca..697a288 100644
  void Board::SetMustacheMode(bool theEnableMustache)
 diff --git a/src/Lawn/FunMenu.cpp b/src/Lawn/FunMenu.cpp
 new file mode 100644
-index 0000000..b5ee303
+index 0000000..bdebf19
 --- /dev/null
 +++ b/src/Lawn/FunMenu.cpp
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,304 @@
 +/*
 + * Optional in-game fun menu for the iOS-oriented PvZ Portable build.
 + * SPDX-License-Identifier: LGPL-3.0-or-later
@@ -127,6 +152,7 @@ index 0000000..b5ee303
 +
 +#include "FunMenu.h"
 +
++#include <algorithm>
 +#include <array>
 +#include <cmath>
 +#include <string_view>
@@ -144,20 +170,23 @@ index 0000000..b5ee303
 +
 +namespace
 +{
-+	constexpr int MENU_BALL_X = 760;
-+	constexpr int MENU_BALL_Y = 300;
 +	constexpr int MENU_BALL_RADIUS = 32;
-+	constexpr int PANEL_X = 430;
-+	constexpr int PANEL_Y = 135;
 +	constexpr int PANEL_WIDTH = 305;
 +	constexpr int PANEL_HEIGHT = 330;
-+	constexpr int ROW_Y = 195;
 +	constexpr int ROW_HEIGHT = 50;
-+	constexpr int CHECKBOX_X = 681;
 +	constexpr int CHECKBOX_SIZE = 28;
++	constexpr int DRAG_THRESHOLD = 6;
 +
 +	struct FunMenuState
 +	{
++		int mBallX = 760;
++		int mBallY = 300;
++		int mDragOffsetX = 0;
++		int mDragOffsetY = 0;
++		int mDragStartX = 0;
++		int mDragStartY = 0;
++		bool mDragging = false;
++		bool mDragged = false;
 +		bool mOpen = false;
 +		bool mInfiniteSun = false;
 +		bool mNoCooldown = false;
@@ -170,9 +199,24 @@ index 0000000..b5ee303
 +
 +	bool PointInMenuBall(int theX, int theY)
 +	{
-+		const int aDeltaX = theX - MENU_BALL_X;
-+		const int aDeltaY = theY - MENU_BALL_Y;
++		const int aDeltaX = theX - gFunMenuState.mBallX;
++		const int aDeltaY = theY - gFunMenuState.mBallY;
 +		return aDeltaX * aDeltaX + aDeltaY * aDeltaY <= MENU_BALL_RADIUS * MENU_BALL_RADIUS;
++	}
++
++	Rect GetPanelRect()
++	{
++		int aPanelX;
++		if (gFunMenuState.mBallX >= BOARD_WIDTH / 2)
++			aPanelX = gFunMenuState.mBallX - MENU_BALL_RADIUS - 12 - PANEL_WIDTH;
++		else
++			aPanelX = gFunMenuState.mBallX + MENU_BALL_RADIUS + 12;
++
++		aPanelX = std::clamp(aPanelX, 10, BOARD_WIDTH - PANEL_WIDTH - 10);
++		const int aPanelY = std::clamp(
++			gFunMenuState.mBallY - PANEL_HEIGHT / 2,
++			10, BOARD_HEIGHT - PANEL_HEIGHT - 10);
++		return Rect(aPanelX, aPanelY, PANEL_WIDTH, PANEL_HEIGHT);
 +	}
 +
 +	void FillCircle(Graphics* g, int theCenterX, int theCenterY, int theRadius, const Color& theColor)
@@ -191,9 +235,9 @@ index 0000000..b5ee303
 +		g->PolyFillAA(aPoints.data(), POINT_COUNT, true);
 +	}
 +
-+	void DrawCheckbox(Graphics* g, int theY, bool theEnabled)
++	void DrawCheckbox(Graphics* g, int theX, int theY, bool theEnabled)
 +	{
-+		const Rect aBox(CHECKBOX_X, theY, CHECKBOX_SIZE, CHECKBOX_SIZE);
++		const Rect aBox(theX, theY, CHECKBOX_SIZE, CHECKBOX_SIZE);
 +		if (theEnabled)
 +		{
 +			g->SetColor(Color(67, 154, 78, 255));
@@ -221,19 +265,23 @@ index 0000000..b5ee303
 +
 +	if (PointInMenuBall(theX, theY))
 +	{
-+		gFunMenuState.mOpen = !gFunMenuState.mOpen;
-+		theBoard->mApp->PlaySample(Sexy::SOUND_BUTTONCLICK);
++		gFunMenuState.mDragging = true;
++		gFunMenuState.mDragged = false;
++		gFunMenuState.mDragStartX = theX;
++		gFunMenuState.mDragStartY = theY;
++		gFunMenuState.mDragOffsetX = theX - gFunMenuState.mBallX;
++		gFunMenuState.mDragOffsetY = theY - gFunMenuState.mBallY;
 +		return true;
 +	}
 +
 +	if (!gFunMenuState.mOpen)
 +		return false;
 +
-+	const Rect aPanel(PANEL_X, PANEL_Y, PANEL_WIDTH, PANEL_HEIGHT);
++	const Rect aPanel = GetPanelRect();
 +	if (!aPanel.Contains(theX, theY))
 +		return false;
 +
-+	const Rect aCloseButton(PANEL_X + PANEL_WIDTH - 38, PANEL_Y + 8, 30, 30);
++	const Rect aCloseButton(aPanel.mX + PANEL_WIDTH - 38, aPanel.mY + 8, 30, 30);
 +	if (aCloseButton.Contains(theX, theY))
 +	{
 +		gFunMenuState.mOpen = false;
@@ -243,7 +291,7 @@ index 0000000..b5ee303
 +
 +	for (int i = 0; i < 5; i++)
 +	{
-+		const Rect aRow(PANEL_X + 12, ROW_Y + i * ROW_HEIGHT, PANEL_WIDTH - 24, ROW_HEIGHT - 3);
++		const Rect aRow(aPanel.mX + 12, aPanel.mY + 60 + i * ROW_HEIGHT, PANEL_WIDTH - 24, ROW_HEIGHT - 3);
 +		if (!aRow.Contains(theX, theY))
 +			continue;
 +
@@ -265,6 +313,41 @@ index 0000000..b5ee303
 +	}
 +
 +	// Swallow touches inside the panel so they never plant or collect behind it.
++	return true;
++}
++
++bool FunMenu::HandleMouseDrag([[maybe_unused]] Board* theBoard, int theX, int theY)
++{
++	if (!gFunMenuState.mDragging)
++		return false;
++
++	if (std::abs(theX - gFunMenuState.mDragStartX) >= DRAG_THRESHOLD ||
++		std::abs(theY - gFunMenuState.mDragStartY) >= DRAG_THRESHOLD)
++	{
++		gFunMenuState.mDragged = true;
++	}
++
++	gFunMenuState.mBallX = std::clamp(
++		theX - gFunMenuState.mDragOffsetX,
++		MENU_BALL_RADIUS, BOARD_WIDTH - MENU_BALL_RADIUS);
++	gFunMenuState.mBallY = std::clamp(
++		theY - gFunMenuState.mDragOffsetY,
++		MENU_BALL_RADIUS, BOARD_HEIGHT - MENU_BALL_RADIUS);
++	return true;
++}
++
++bool FunMenu::HandleMouseUp(Board* theBoard, [[maybe_unused]] int theX,
++	[[maybe_unused]] int theY, int theClickCount)
++{
++	if (!gFunMenuState.mDragging)
++		return false;
++
++	gFunMenuState.mDragging = false;
++	if (!gFunMenuState.mDragged && theClickCount > 0)
++	{
++		gFunMenuState.mOpen = !gFunMenuState.mOpen;
++		theBoard->mApp->PlaySample(Sexy::SOUND_BUTTONCLICK);
++	}
 +	return true;
 +}
 +
@@ -304,6 +387,7 @@ index 0000000..b5ee303
 +	if (theApp)
 +		theApp->mUpdateMultiplier = 1.0;
 +	gFunMenuState.mOpen = false;
++	gFunMenuState.mDragging = false;
 +}
 +
 +bool FunMenu::FreePlantingEnabled()
@@ -322,18 +406,19 @@ index 0000000..b5ee303
 +
 +	if (gFunMenuState.mOpen)
 +	{
++		const Rect aPanel = GetPanelRect();
 +		g->SetColor(Color(0, 0, 0, 38));
 +		g->FillRect(0, 0, BOARD_WIDTH, BOARD_HEIGHT);
 +
 +		g->SetColor(Color(21, 70, 39, 236));
-+		g->FillRect(PANEL_X, PANEL_Y, PANEL_WIDTH, PANEL_HEIGHT);
++		g->FillRect(aPanel);
 +		g->SetColor(Color(232, 201, 99, 255));
-+		g->DrawRect(PANEL_X, PANEL_Y, PANEL_WIDTH, PANEL_HEIGHT);
-+		g->DrawRect(PANEL_X + 2, PANEL_Y + 2, PANEL_WIDTH - 4, PANEL_HEIGHT - 4);
++		g->DrawRect(aPanel);
++		g->DrawRect(aPanel.mX + 2, aPanel.mY + 2, PANEL_WIDTH - 4, PANEL_HEIGHT - 4);
 +
-+		PvzpDrawString(g, "趣味功能", PANEL_X + PANEL_WIDTH / 2, PANEL_Y + 38,
++		PvzpDrawString(g, "趣味功能", aPanel.mX + PANEL_WIDTH / 2, aPanel.mY + 38,
 +			Sexy::FONT_DWARVENTODCRAFT18YELLOW, Color::White, DrawStringJustification::DS_ALIGN_CENTER);
-+		PvzpDrawString(g, "×", PANEL_X + PANEL_WIDTH - 22, PANEL_Y + 31,
++		PvzpDrawString(g, "×", aPanel.mX + PANEL_WIDTH - 22, aPanel.mY + 31,
 +			Sexy::FONT_DWARVENTODCRAFT18, Color(255, 242, 190), DrawStringJustification::DS_ALIGN_CENTER);
 +
 +		constexpr std::array<std::string_view, 5> LABELS = {
@@ -349,27 +434,27 @@ index 0000000..b5ee303
 +
 +		for (int i = 0; i < 5; i++)
 +		{
-+			const int aY = ROW_Y + i * ROW_HEIGHT;
++			const int aY = aPanel.mY + 60 + i * ROW_HEIGHT;
 +			g->SetColor(Color(9, 45, 28, 150));
-+			g->FillRect(PANEL_X + 12, aY, PANEL_WIDTH - 24, ROW_HEIGHT - 3);
-+			PvzpDrawString(g, LABELS[i], PANEL_X + 28, aY + 31,
++			g->FillRect(aPanel.mX + 12, aY, PANEL_WIDTH - 24, ROW_HEIGHT - 3);
++			PvzpDrawString(g, LABELS[i], aPanel.mX + 28, aY + 31,
 +				Sexy::FONT_BRIANNETOD16, Color::White, DrawStringJustification::DS_ALIGN_LEFT);
-+			DrawCheckbox(g, aY + 9, aEnabled[i]);
++			DrawCheckbox(g, aPanel.mX + PANEL_WIDTH - 54, aY + 9, aEnabled[i]);
 +		}
 +	}
 +
-+	FillCircle(g, MENU_BALL_X, MENU_BALL_Y, MENU_BALL_RADIUS, Color(232, 201, 99, 255));
-+	FillCircle(g, MENU_BALL_X, MENU_BALL_Y, MENU_BALL_RADIUS - 4, Color(31, 150, 64, 245));
-+	FillCircle(g, MENU_BALL_X - 8, MENU_BALL_Y - 9, 7, Color(145, 239, 151, 150));
-+	PvzpDrawString(g, "菜单", MENU_BALL_X, MENU_BALL_Y + 7,
++	FillCircle(g, gFunMenuState.mBallX, gFunMenuState.mBallY, MENU_BALL_RADIUS, Color(232, 201, 99, 255));
++	FillCircle(g, gFunMenuState.mBallX, gFunMenuState.mBallY, MENU_BALL_RADIUS - 4, Color(31, 150, 64, 245));
++	FillCircle(g, gFunMenuState.mBallX - 8, gFunMenuState.mBallY - 9, 7, Color(145, 239, 151, 150));
++	PvzpDrawString(g, "菜单", gFunMenuState.mBallX, gFunMenuState.mBallY + 7,
 +		Sexy::FONT_BRIANNETOD16, Color::White, DrawStringJustification::DS_ALIGN_CENTER);
 +}
 diff --git a/src/Lawn/FunMenu.h b/src/Lawn/FunMenu.h
 new file mode 100644
-index 0000000..a30fdc5
+index 0000000..8860a29
 --- /dev/null
 +++ b/src/Lawn/FunMenu.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,30 @@
 +/*
 + * Optional in-game fun menu for the iOS-oriented PvZ Portable build.
 + * SPDX-License-Identifier: LGPL-3.0-or-later
@@ -389,6 +474,8 @@ index 0000000..a30fdc5
 +namespace FunMenu
 +{
 +	bool HandleMouseDown(Board* theBoard, int theX, int theY, int theClickCount);
++	bool HandleMouseDrag(Board* theBoard, int theX, int theY);
++	bool HandleMouseUp(Board* theBoard, int theX, int theY, int theClickCount);
 +	void Draw(Board* theBoard, Sexy::Graphics* g);
 +	void Apply(Board* theBoard);
 +	void BoardDestroyed(LawnApp* theApp);
@@ -498,4 +585,77 @@ index a7b1fb1..4b40677 100644
  	}
  #elif defined(__EMSCRIPTEN__)
  	mResourceDir = "/";
+diff --git a/src/SexyAppFramework/graphics/GLInterface.cpp b/src/SexyAppFramework/graphics/GLInterface.cpp
+index 963c3f3..c2c47e0 100644
+--- a/src/SexyAppFramework/graphics/GLInterface.cpp
++++ b/src/SexyAppFramework/graphics/GLInterface.cpp
+@@ -1152,16 +1152,22 @@ GLImage* GLInterface::GetScreenImage() { return mScreenImage.get(); }
+ void GLInterface::UpdateViewport()
+ {
+ 	int vx = 0, vy = 0, vw, vh;
++	int presentX = 0, presentY = 0, presentWidth, presentHeight;
+ 
+ #ifdef __SWITCH__
+ 	int width = 1280, height = 720;
++	int windowWidth = width, windowHeight = height;
+ #else
+ 	int width, height;
+ 	SDL_GL_GetDrawableSize((SDL_Window*)mApp->mWindow, &width, &height);
++	int windowWidth, windowHeight;
++	SDL_GetWindowSize((SDL_Window*)mApp->mWindow, &windowWidth, &windowHeight);
+ #endif
+ 
+ 	vw = width; vh = height;
++	presentWidth = windowWidth; presentHeight = windowHeight;
+ 
++#ifndef __IPHONEOS__
+ 	// Letterbox to 4:3
+ 	if (width * 3 > height * 4)
+ 	{
+@@ -1174,8 +1180,21 @@ void GLInterface::UpdateViewport()
+ 		vy = (height - vh) / 2;
+ 	}
+ 
++	// Mouse/touch events use window points, while glViewport uses drawable pixels.
++	if (windowWidth * 3 > windowHeight * 4)
++	{
++		presentWidth = windowHeight * 4 / 3;
++		presentX = (windowWidth - presentWidth) / 2;
++	}
++	else if (windowWidth * 3 < windowHeight * 4)
++	{
++		presentHeight = windowWidth * 3 / 4;
++		presentY = (windowHeight - presentHeight) / 2;
++	}
++#endif
++
+ 	glViewport(vx, vy, vw, vh);
+-	mPresentationRect = Rect(vx, vy, vw, vh);
++	mPresentationRect = Rect(presentX, presentY, presentWidth, presentHeight);
+ }
+ 
+ int GLInterface::Init(bool IsWindowed)
+diff --git a/src/SexyAppFramework/platform/default/Window.cpp b/src/SexyAppFramework/platform/default/Window.cpp
+index 737bd98..7b430a2 100644
+--- a/src/SexyAppFramework/platform/default/Window.cpp
++++ b/src/SexyAppFramework/platform/default/Window.cpp
+@@ -53,11 +53,18 @@ void SexyAppBase::MakeWindow()
+ #if (defined(__ANDROID__) && !defined(__TERMUX__)) || defined(__IPHONEOS__)
+ 		SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+ #endif
++#ifdef __IPHONEOS__
++		SDL_SetHint("SDL_IOS_HIDE_HOME_INDICATOR", "2");
++#endif
+ 
+ 		SDL_Init(SDL_INIT_VIDEO);
+ 
+ 		Uint32 winFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
+ 			| (!mIsWindowed ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
++#ifdef __IPHONEOS__
++		// Request Retina/native pixel backing instead of the low-resolution point surface.
++		winFlags |= SDL_WINDOW_ALLOW_HIGHDPI;
++#endif
+ 
+ 		using WindowPtr = std::unique_ptr<SDL_Window, decltype(&SDL_DestroyWindow)>;
+ 		using GLContextPtr = std::unique_ptr<std::remove_pointer_t<SDL_GLContext>, decltype(&SDL_GL_DeleteContext)>;
 
