@@ -1,0 +1,149 @@
+name: iPhone TRUE FULLSCREEN stretched 120Hz build
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: iphone-ios-true-fullscreen-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IOS_DEPLOY_TARGET: "16.4"
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+
+jobs:
+  build-ios:
+    name: Build TRUE FULLSCREEN stretched 120Hz engine
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Apply stretched high-refresh patch
+        shell: bash
+        run: |
+          git apply <<'PVZ_STRETCHED_PATCH'
+          diff --git a/ios/Info.plist.in b/ios/Info.plist.in
+          index d3e80e5..92938f6 100644
+          --- a/ios/Info.plist.in
+          +++ b/ios/Info.plist.in
+          @@ -45,6 +45,9 @@
+           	<false/>
+           	<key>UIRequiresFullScreen</key>
+           	<true/>
+          +	<!-- Permit 120 Hz presentation on ProMotion iPhones. -->
+          +	<key>CADisableMinimumFrameDurationOnPhone</key>
+          +	<true/>
+           	<key>UIFileSharingEnabled</key>
+           	<true/>
+           	<key>LSSupportsOpeningDocumentsInPlace</key>
+          diff --git a/src/SexyAppFramework/SexyAppBase.cpp b/src/SexyAppFramework/SexyAppBase.cpp
+          index a7b1fb1..c260c34 100644
+          --- a/src/SexyAppFramework/SexyAppBase.cpp
+          +++ b/src/SexyAppFramework/SexyAppBase.cpp
+          @@ -187,12 +187,13 @@ SexyAppBase::SexyAppBase()
+           		mResourceDir = "";
+           	}
+           #elif defined(__IPHONEOS__)
+          -	// iOS: use Documents directory (visible in Files app via UIFileSharingEnabled)
+          +	// Bundle game data inside the IPA while keeping writable saves in Documents.
+           	{
+          -		const char* aHome = std::getenv("HOME");
+          -		if (aHome != nullptr && aHome[0] != '\0')
+          +		char* aBasePath = SDL_GetBasePath();
+          +		if (aBasePath != nullptr)
+           		{
+          -			mResourceDir = (std::filesystem::path(aHome) / "Documents").generic_string() + "/";
+          +			mResourceDir = aBasePath;
+          +			SDL_free(aBasePath);
+           		}
+           		else
+           		{
+          diff --git a/src/SexyAppFramework/graphics/GLInterface.cpp b/src/SexyAppFramework/graphics/GLInterface.cpp
+          index 963c3f3..fbd6d27 100644
+          --- a/src/SexyAppFramework/graphics/GLInterface.cpp
+          +++ b/src/SexyAppFramework/graphics/GLInterface.cpp
+          @@ -1095,7 +1095,11 @@ GLInterface::GLInterface(SexyAppBase* theApp)
+           	mDisplayWidth  = mWidth;
+           	mDisplayHeight = mHeight;
+           	mPresentationRect = Rect(0, 0, mWidth, mHeight);
+          +#ifdef __IPHONEOS__
+          +	mRefreshRate = 120;
+          +#else
+           	mRefreshRate = 60;
+          +#endif
+           	mMillisecondsPerFrame = 1000 / mRefreshRate;
+           	mNextCursorX = mNextCursorY = 0;
+           	mCursorX = mCursorY = 0;
+          @@ -1158,6 +1162,14 @@ void GLInterface::UpdateViewport()
+           #else
+           	int width, height;
+           	SDL_GL_GetDrawableSize((SDL_Window*)mApp->mWindow, &width, &height);
+           #endif
+           
+          +#ifdef __IPHONEOS__
+          +	int windowWidth = 0, windowHeight = 0;
+          +	SDL_GetWindowSize((SDL_Window*)mApp->mWindow, &windowWidth, &windowHeight);
+          +	glViewport(0, 0, width, height);
+          +	mPresentationRect = Rect(0, 0, windowWidth, windowHeight);
+          +	return;
+          +#endif
+          +
+           	vw = width; vh = height;
+          PVZ_STRETCHED_PATCH
+
+      - name: Get toolchain ID
+        shell: bash
+        run: |
+          CLANG_VER=$(clang --version | head -1 | sed -nE 's/.*version ([0-9.]+).*/\1/p')
+          echo "VCPKG_TC=clang-${CLANG_VER:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Restore dependency cache
+        uses: actions/cache@v6
+        with:
+          path: vcpkg-cache
+          key: vcpkg-ios-${{ env.VCPKG_TC }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'CMake/triplets/arm64-ios.cmake') }}
+          restore-keys: |
+            vcpkg-ios-${{ env.VCPKG_TC }}-
+            vcpkg-ios-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+
+      - name: Build arm64 iOS app
+        shell: bash
+        run: |
+          cmake -B build-ios \
+            -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_OVERLAY_TRIPLETS=$GITHUB_WORKSPACE/CMake/triplets \
+            -DVCPKG_TARGET_TRIPLET=arm64-ios \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=$IOS_DEPLOY_TARGET \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Xcode
+
+          cmake --build build-ios --config Release -- \
+            -sdk iphoneos \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Create unsigned IPA
+        shell: bash
+        run: |
+          APP_PATH=$(find build-ios -name "pvz-portable.app" -path "*Release*" | head -1)
+          test -n "$APP_PATH"
+          mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/
+          cd dist
+          zip -r -y PvZ-TrueFullScreen-Stretched-120Hz-engine-unsigned.ipa Payload/
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: PvZ-TrueFullScreen-Stretched-120Hz-engine-unsigned
+          path: dist/PvZ-TrueFullScreen-Stretched-120Hz-engine-unsigned.ipa
+          if-no-files-found: error
