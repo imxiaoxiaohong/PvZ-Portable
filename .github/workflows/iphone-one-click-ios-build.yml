@@ -1,0 +1,371 @@
+name: iPhone one-click iOS adaptive 120Hz build
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: iphone-ios-adaptive-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IOS_DEPLOY_TARGET: "16.4"
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+
+jobs:
+  build-ios:
+    name: Build adaptive 120Hz engine
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Apply adaptive presentation patch
+        shell: bash
+        run: |
+          git apply <<'PVZ_ADAPTIVE_PATCH'
+          diff --git a/ios/Info.plist.in b/ios/Info.plist.in
+          index d3e80e5..92938f6 100644
+          --- a/ios/Info.plist.in
+          +++ b/ios/Info.plist.in
+          @@ -45,6 +45,9 @@
+           	<false/>
+           	<key>UIRequiresFullScreen</key>
+           	<true/>
+          +	<!-- Permit 120 Hz presentation on ProMotion iPhones. -->
+          +	<key>CADisableMinimumFrameDurationOnPhone</key>
+          +	<true/>
+           	<key>UIFileSharingEnabled</key>
+           	<true/>
+           	<key>LSSupportsOpeningDocumentsInPlace</key>
+          diff --git a/src/SexyAppFramework/SexyAppBase.cpp b/src/SexyAppFramework/SexyAppBase.cpp
+          index a7b1fb1..c260c34 100644
+          --- a/src/SexyAppFramework/SexyAppBase.cpp
+          +++ b/src/SexyAppFramework/SexyAppBase.cpp
+          @@ -187,12 +187,15 @@ SexyAppBase::SexyAppBase()
+           		mResourceDir = "";
+           	}
+           #elif defined(__IPHONEOS__)
+          -	// iOS: use Documents directory (visible in Files app via UIFileSharingEnabled)
+          +	// This custom IPA bundles its game data inside the app.  Writable saves
+          +	// remain in Documents (configured later), while resources follow the
+          +	// executable so the repacked IPA works immediately after sideloading.
+           	{
+          -		const char* aHome = std::getenv("HOME");
+          -		if (aHome != nullptr && aHome[0] != '\0')
+          +		char* aBasePath = SDL_GetBasePath();
+          +		if (aBasePath != nullptr)
+           		{
+          -			mResourceDir = (std::filesystem::path(aHome) / "Documents").generic_string() + "/";
+          +			mResourceDir = aBasePath;
+          +			SDL_free(aBasePath);
+           		}
+           		else
+           		{
+          diff --git a/src/SexyAppFramework/graphics/GLInterface.cpp b/src/SexyAppFramework/graphics/GLInterface.cpp
+          index 963c3f3..8a52694 100644
+          --- a/src/SexyAppFramework/graphics/GLInterface.cpp
+          +++ b/src/SexyAppFramework/graphics/GLInterface.cpp
+          @@ -86,6 +86,61 @@ static GLuint gProgram;
+           static GLuint gVbo;
+           static GLint gUfViewProjMtx, gUfTexture, gUfUseTexture, gUfUvBounds, gUfClampUvEnabled;
+           
+          +#ifdef __IPHONEOS__
+          +// Keep the game on its original 800x600 target, then compose a live,
+          +// softened aspect-fill background under an undistorted foreground.
+          +static GLuint gPresentationProgram;
+          +static GLuint gGameFramebuffer;
+          +static GLuint gGameTexture;
+          +static GLint gPresentationTextureLoc;
+          +static GLint gPresentationUvScaleYLoc;
+          +static GLint gPresentationBlurLoc;
+          +static GLint gPresentationTexelLoc;
+          +static GLint gPresentationDimLoc;
+          +static GLint gDefaultFramebuffer;
+          +static int gDrawableWidth = 800;
+          +static int gDrawableHeight = 600;
+          +static bool gPresentationReady = false;
+          +
+          +static constexpr const char* PRESENTATION_SHADER_CODE = R"DELIMITER(
+          +V2F vec2 v_uv;
+          +
+          +#ifdef VERTEX
+          +	VERT_IN vec3 a_position;
+          +	VERT_IN vec2 a_uv;
+          +	void main() {
+          +		v_uv = a_uv;
+          +		gl_Position = vec4(a_position.xy, 0.0, 1.0);
+          +	}
+          +#endif
+          +#ifdef FRAGMENT
+          +	uniform sampler2D u_texture;
+          +	uniform float u_uvScaleY;
+          +	uniform float u_blur;
+          +	uniform vec2 u_texel;
+          +	uniform float u_dim;
+          +	void main() {
+          +		vec2 uv = vec2(v_uv.x, 0.5 + (v_uv.y - 0.5) * u_uvScaleY);
+          +		vec4 color = TEX2D(u_texture, uv);
+          +		if (u_blur > 0.5) {
+          +			vec2 dx = vec2(u_texel.x * 5.0, 0.0);
+          +			vec2 dy = vec2(0.0, u_texel.y * 5.0);
+          +			color = color * 0.28
+          +				+ TEX2D(u_texture, uv - dx) * 0.12
+          +				+ TEX2D(u_texture, uv + dx) * 0.12
+          +				+ TEX2D(u_texture, uv - dy) * 0.12
+          +				+ TEX2D(u_texture, uv + dy) * 0.12
+          +				+ TEX2D(u_texture, uv - dx - dy) * 0.06
+          +				+ TEX2D(u_texture, uv + dx - dy) * 0.06
+          +				+ TEX2D(u_texture, uv - dx + dy) * 0.06
+          +				+ TEX2D(u_texture, uv + dx + dy) * 0.06;
+          +		}
+          +		FRAG_OUT = vec4(color.rgb * u_dim, 1.0);
+          +	}
+          +#endif
+          +)DELIMITER";
+          +#endif
+          +
+           static void GfxBegin(GLenum vertexMode)
+           {
+           	if (gVertexMode != (GLenum)-1) return;
+          @@ -1095,7 +1150,11 @@ GLInterface::GLInterface(SexyAppBase* theApp)
+           	mDisplayWidth  = mWidth;
+           	mDisplayHeight = mHeight;
+           	mPresentationRect = Rect(0, 0, mWidth, mHeight);
+          +	#ifdef __IPHONEOS__
+          +	mRefreshRate = 120;
+          +	#else
+           	mRefreshRate = 60;
+          +	#endif
+           	mMillisecondsPerFrame = 1000 / mRefreshRate;
+           	mNextCursorX = mNextCursorY = 0;
+           	mCursorX = mCursorY = 0;
+          @@ -1109,6 +1168,18 @@ GLInterface::~GLInterface()
+           {
+           	mScreenImage.reset();
+           	Flush();
+          +	#ifdef __IPHONEOS__
+          +	if (gGameFramebuffer != 0)
+          +		glDeleteFramebuffers(1, &gGameFramebuffer);
+          +	if (gGameTexture != 0)
+          +		glDeleteTextures(1, &gGameTexture);
+          +	if (gPresentationProgram != 0)
+          +		glDeleteProgram(gPresentationProgram);
+          +	gGameFramebuffer = 0;
+          +	gGameTexture = 0;
+          +	gPresentationProgram = 0;
+          +	gPresentationReady = false;
+          +	#endif
+           	for (auto *img : mImageSet)
+           	{
+           		delete (TextureData*)img->mRenderData;
+          @@ -1174,8 +1245,37 @@ void GLInterface::UpdateViewport()
+           		vy = (height - vh) / 2;
+           	}
+           
+          +	#ifdef __IPHONEOS__
+          +	gDrawableWidth = std::max(width, 1);
+          +	gDrawableHeight = std::max(height, 1);
+          +
+          +	// Touch events use window points rather than drawable pixels.  Keep the
+          +	// input rectangle aligned with the sharp 4:3 foreground.
+          +	int windowWidth = 0, windowHeight = 0;
+          +	SDL_GetWindowSize((SDL_Window*)mApp->mWindow, &windowWidth, &windowHeight);
+          +	int sourceX = 0, sourceY = 0;
+          +	int sourceWidth = windowWidth, sourceHeight = windowHeight;
+          +	if (windowWidth * 3 > windowHeight * 4)
+          +	{
+          +		sourceWidth = windowHeight * 4 / 3;
+          +		sourceX = (windowWidth - sourceWidth) / 2;
+          +	}
+          +	else if (windowWidth * 3 < windowHeight * 4)
+          +	{
+          +		sourceHeight = windowWidth * 3 / 4;
+          +		sourceY = (windowHeight - sourceHeight) / 2;
+          +	}
+          +	mPresentationRect = Rect(sourceX, sourceY, sourceWidth, sourceHeight);
+          +
+          +	if (gPresentationReady)
+          +	{
+          +		glBindFramebuffer(GL_FRAMEBUFFER, gGameFramebuffer);
+          +		glViewport(0, 0, mWidth, mHeight);
+          +	}
+          +	#else
+           	glViewport(vx, vy, vw, vh);
+           	mPresentationRect = Rect(vx, vy, vw, vh);
+          +	#endif
+           }
+           
+           int GLInterface::Init(bool IsWindowed)
+          @@ -1236,6 +1336,46 @@ int GLInterface::Init(bool IsWindowed)
+           	glDisable(GL_FRAMEBUFFER_SRGB); // Prevent double gamma correction (already sRGB passthrough)
+           	glGetError(); // clear GL_INVALID_ENUM on pure GLES implementations
+           
+          +	#ifdef __IPHONEOS__
+          +	// SDL owns the actual onscreen framebuffer on iOS; save it before binding
+          +	// the logical game framebuffer.
+          +	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &gDefaultFramebuffer);
+          +	gPresentationProgram = shaderLoad(PRESENTATION_SHADER_CODE);
+          +	if (gPresentationProgram != 0)
+          +	{
+          +		gPresentationTextureLoc = glGetUniformLocation(gPresentationProgram, "u_texture");
+          +		gPresentationUvScaleYLoc = glGetUniformLocation(gPresentationProgram, "u_uvScaleY");
+          +		gPresentationBlurLoc = glGetUniformLocation(gPresentationProgram, "u_blur");
+          +		gPresentationTexelLoc = glGetUniformLocation(gPresentationProgram, "u_texel");
+          +		gPresentationDimLoc = glGetUniformLocation(gPresentationProgram, "u_dim");
+          +
+          +		glGenTextures(1, &gGameTexture);
+          +		glBindTexture(GL_TEXTURE_2D, gGameTexture);
+          +		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+          +		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+          +		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+          +		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+          +		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, mWidth, mHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+          +
+          +		glGenFramebuffers(1, &gGameFramebuffer);
+          +		glBindFramebuffer(GL_FRAMEBUFFER, gGameFramebuffer);
+          +		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gGameTexture, 0);
+          +		gPresentationReady = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+          +	}
+          +
+          +	if (gPresentationReady)
+          +	{
+          +		glViewport(0, 0, mWidth, mHeight);
+          +		glClearColor(0, 0, 0, 1);
+          +		glClear(GL_COLOR_BUFFER_BIT);
+          +		glUseProgram(gProgram);
+          +	}
+          +	else
+          +	{
+          +		glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(gDefaultFramebuffer));
+          +	}
+          +	#endif
+          +
+           	mRGBBits   = 32;
+           	mRedBits   = 8; mGreenBits = 8; mBlueBits  = 8;
+           	mRedShift  = 0; mGreenShift = 8; mBlueShift = 16;
+          @@ -1279,6 +1419,66 @@ void GLInterface::Flush()
+           #ifdef __SWITCH__
+           	eglSwapBuffers(mApp->mWindow, mApp->mSurface);
+           #else
+          +	#ifdef __IPHONEOS__
+          +	if (gPresentationReady)
+          +	{
+          +		glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(gDefaultFramebuffer));
+          +		glViewport(0, 0, gDrawableWidth, gDrawableHeight);
+          +		glClearColor(0, 0, 0, 1);
+          +		glClear(GL_COLOR_BUFFER_BIT);
+          +
+          +		glUseProgram(gPresentationProgram);
+          +		glActiveTexture(GL_TEXTURE0);
+          +		glBindTexture(GL_TEXTURE_2D, gGameTexture);
+          +		glUniform1i(gPresentationTextureLoc, 0);
+          +		glUniform2f(gPresentationTexelLoc, 1.0f / mWidth, 1.0f / mHeight);
+          +
+          +		const GLVertex aQuad[4] = {
+          +			{ -1.0f, -1.0f, 0.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+          +			{ -1.0f,  1.0f, 0.0f, 0xFFFFFFFFu, 0.0f, 1.0f },
+          +			{  1.0f, -1.0f, 0.0f, 0xFFFFFFFFu, 1.0f, 0.0f },
+          +			{  1.0f,  1.0f, 0.0f, 0xFFFFFFFFu, 1.0f, 1.0f },
+          +		};
+          +		glBindBuffer(GL_ARRAY_BUFFER, gVbo);
+          +		glBufferData(GL_ARRAY_BUFFER, sizeof(aQuad), aQuad, GL_DYNAMIC_DRAW);
+          +
+          +		const float aGameAspect = static_cast<float>(mWidth) / mHeight;
+          +		const float aDrawableAspect = static_cast<float>(gDrawableWidth) / gDrawableHeight;
+          +		glUniform1f(gPresentationUvScaleYLoc, std::min(1.0f, aGameAspect / aDrawableAspect));
+          +		glUniform1f(gPresentationBlurLoc, 1.0f);
+          +		glUniform1f(gPresentationDimLoc, 0.72f);
+          +		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+          +
+          +		int aViewWidth = gDrawableWidth;
+          +		int aViewHeight = gDrawableHeight;
+          +		int aViewX = 0;
+          +		int aViewY = 0;
+          +		if (aViewWidth * 3 > aViewHeight * 4)
+          +		{
+          +			aViewWidth = aViewHeight * 4 / 3;
+          +			aViewX = (gDrawableWidth - aViewWidth) / 2;
+          +		}
+          +		else if (aViewWidth * 3 < aViewHeight * 4)
+          +		{
+          +			aViewHeight = aViewWidth * 3 / 4;
+          +			aViewY = (gDrawableHeight - aViewHeight) / 2;
+          +		}
+          +		glViewport(aViewX, aViewY, aViewWidth, aViewHeight);
+          +		glUniform1f(gPresentationUvScaleYLoc, 1.0f);
+          +		glUniform1f(gPresentationBlurLoc, 0.0f);
+          +		glUniform1f(gPresentationDimLoc, 1.0f);
+          +		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+          +
+          +		SDL_GL_SwapWindow((SDL_Window*)mApp->mWindow);
+          +
+          +		glBindFramebuffer(GL_FRAMEBUFFER, gGameFramebuffer);
+          +		glViewport(0, 0, mWidth, mHeight);
+          +		glUseProgram(gProgram);
+          +		glClearColor(0, 0, 0, 1);
+          +		glClear(GL_COLOR_BUFFER_BIT);
+          +		return;
+          +	}
+          +	#endif
+           	SDL_GL_SwapWindow((SDL_Window*)mApp->mWindow);
+           #endif
+           #ifndef __EMSCRIPTEN__
+          PVZ_ADAPTIVE_PATCH
+
+      - name: Get toolchain ID
+        shell: bash
+        run: |
+          CLANG_VER=$(clang --version | head -1 | sed -nE 's/.*version ([0-9.]+).*/\1/p')
+          echo "VCPKG_TC=clang-${CLANG_VER:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Restore dependency cache
+        uses: actions/cache@v6
+        with:
+          path: vcpkg-cache
+          key: vcpkg-ios-${{ env.VCPKG_TC }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'CMake/triplets/arm64-ios.cmake') }}
+          restore-keys: |
+            vcpkg-ios-${{ env.VCPKG_TC }}-
+            vcpkg-ios-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+
+      - name: Build arm64 iOS app
+        shell: bash
+        run: |
+          cmake -B build-ios \
+            -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_OVERLAY_TRIPLETS=$GITHUB_WORKSPACE/CMake/triplets \
+            -DVCPKG_TARGET_TRIPLET=arm64-ios \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=$IOS_DEPLOY_TARGET \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Xcode
+
+          cmake --build build-ios --config Release -- \
+            -sdk iphoneos \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Create unsigned IPA
+        shell: bash
+        run: |
+          APP_PATH=$(find build-ios -name "pvz-portable.app" -path "*Release*" | head -1)
+          test -n "$APP_PATH"
+          mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/
+          cd dist
+          zip -r -y PvZ-Adaptive-120Hz-engine-unsigned.ipa Payload/
+          rm -rf Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: PvZ-Adaptive-120Hz-engine-unsigned
+          path: dist/PvZ-Adaptive-120Hz-engine-unsigned.ipa
+          if-no-files-found: error
+
